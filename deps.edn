@@ -1,0 +1,6 @@
+{:paths ["src/clj"]
+ :deps {metosin/malli {:mvn/version "0.16.4"}
+        cheshire/cheshire {:mvn/version "5.13.0"}
+        hato/hato {:mvn/version "0.9.0"}
+        ring/ring-core {:mvn/version "1.12.2"}
+        http-kit/http-kit {:mvn/version "2.8.0-RC1"}}}
