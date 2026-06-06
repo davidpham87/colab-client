@@ -32,13 +32,14 @@ import {
   TooManyAssignmentsError,
 } from '../colab/client';
 import { REMOVE_SERVER } from '../colab/commands/constants';
+import { ColabRequestError } from '../colab/errors';
 import {
   COLAB_CLIENT_AGENT_HEADER,
   COLAB_RUNTIME_PROXY_TOKEN_HEADER,
 } from '../colab/headers';
 import { log } from '../common/logging';
 import { telemetry } from '../telemetry';
-import { CommandSource } from '../telemetry/api';
+import { AssignmentOutcome, CommandSource } from '../telemetry/api';
 import { ProxiedJupyterClient } from './client';
 import { colabProxyWebSocket } from './colab-proxy-websocket';
 import {
@@ -256,25 +257,10 @@ export class AssignmentManager implements Disposable {
 
     let unownedServers: UnownedServer[] = [];
     if (from === 'external' || from === 'all') {
-      const storedEndpointSet = new Set(storedServers.map((s) => s.endpoint));
-      unownedServers = await Promise.all(
-        allAssignments
-          .filter((a) => !storedEndpointSet.has(a.endpoint))
-          .map(async (a) => {
-            // For any remote servers created in Colab web UI, assuming there is
-            // only one session per assignment.
-            const sessions = await this.client.listSessions(a.endpoint, signal);
-            const label =
-              sessions.length === 1 && sessions[0].name?.length
-                ? sessions[0].name
-                : UNKNOWN_REMOTE_SERVER_NAME;
-            return {
-              label,
-              endpoint: a.endpoint,
-              variant: a.variant,
-              accelerator: a.accelerator,
-            };
-          }),
+      unownedServers = await this.getUnownedServers(
+        allAssignments,
+        storedServers,
+        signal,
       );
     }
 
@@ -327,60 +313,76 @@ export class AssignmentManager implements Disposable {
     this.guardDisposed();
     const id = randomUUID();
     const { label, variant, accelerator, shape, version } = descriptor;
-    let assignment: Assignment;
+    let outcome = AssignmentOutcome.ASSIGNMENT_OUTCOME_UNSPECIFIED;
+    let hadFallback = false;
     try {
-      if (isColabServerDescriptorWithAccelerator(descriptor)) {
-        assignment = await this.assignWithFallback(
+      let assignment: Assignment;
+      try {
+        if (isColabServerDescriptorWithAccelerator(descriptor)) {
+          assignment = await this.assignWithFallback(
+            id,
+            descriptor,
+            /* fallbacks= */ undefined,
+            signal,
+          );
+          hadFallback = assignment.accelerator !== descriptor.accelerator;
+        } else {
+          ({ assignment } = await this.client.assign(
+            id,
+            { variant, accelerator, shape, version },
+            signal,
+          ));
+        }
+      } catch (error) {
+        log.trace(`Failed assigning server ${id}`, error);
+        outcome = errorToAssignmentOutcome(error);
+        if (error instanceof AllAcceleratorsUnavailableError) {
+          hadFallback = error.attempted.length > 1;
+          void this.notifyAllAcceleratorsUnavailable(error);
+        }
+        // TODO: Consider listing assignments to check if there are too many
+        // before the user goes through the assignment flow. This handling logic
+        // would still be needed for the rare race condition where an assignment
+        // is made (e.g. in Colab web) during the extension assignment flow.
+        if (error instanceof TooManyAssignmentsError) {
+          void this.notifyMaxAssignmentsExceeded();
+        }
+        if (error instanceof InsufficientQuotaError) {
+          void this.notifyInsufficientQuota(error);
+        }
+        if (error instanceof DenylistedError) {
+          this.notifyBanned(error);
+        }
+        throw error;
+      }
+      const server = this.toAssignedServer(
+        {
           id,
-          descriptor,
-          /* fallbacks= */ undefined,
-          signal,
-        );
-      } else {
-        ({ assignment } = await this.client.assign(
-          id,
-          { variant, accelerator, shape, version },
-          signal,
-        ));
-      }
-    } catch (error) {
-      log.trace(`Failed assigning server ${id}`, error);
-      if (error instanceof AllAcceleratorsUnavailableError) {
-        void this.notifyAllAcceleratorsUnavailable(error);
-      }
-      // TODO: Consider listing assignments to check if there are too many
-      // before the user goes through the assignment flow. This handling logic
-      // would still be needed for the rare race condition where an assignment
-      // is made (e.g. in Colab web) during the extension assignment flow.
-      if (error instanceof TooManyAssignmentsError) {
-        void this.notifyMaxAssignmentsExceeded();
-      }
-      if (error instanceof InsufficientQuotaError) {
-        void this.notifyInsufficientQuota(error);
-      }
-      if (error instanceof DenylistedError) {
-        this.notifyBanned(error);
-      }
-      throw error;
+          label,
+          variant: assignment.variant,
+          accelerator: assignment.accelerator,
+        },
+        assignment.endpoint,
+        assignment.runtimeProxyInfo,
+        new Date(),
+      );
+      await this.storage.store([server]);
+      this.assignmentChange.fire({
+        added: [server],
+        removed: [],
+        changed: [],
+      });
+      outcome = AssignmentOutcome.ASSIGNMENT_OUTCOME_SUCCEEDED;
+      return server;
+    } finally {
+      telemetry.logAssignServer(outcome, {
+        variant,
+        accelerator: accelerator ?? '',
+        shape: shape !== undefined ? Shape[shape] : '',
+        version: version ?? '',
+        hadFallback,
+      });
     }
-    const server = this.toAssignedServer(
-      {
-        id,
-        label,
-        variant: assignment.variant,
-        accelerator: assignment.accelerator,
-      },
-      assignment.endpoint,
-      assignment.runtimeProxyInfo,
-      new Date(),
-    );
-    await this.storage.store([server]);
-    this.assignmentChange.fire({
-      added: [server],
-      removed: [],
-      changed: [],
-    });
-    return server;
   }
 
   /**
@@ -712,6 +714,64 @@ export class AssignmentManager implements Disposable {
     };
   }
 
+  private async getUnownedServers(
+    allAssignments: ListedAssignment[],
+    storedServers: ColabAssignedServer[],
+    signal?: AbortSignal,
+  ): Promise<UnownedServer[]> {
+    const storedEndpointSet = new Set(storedServers.map((s) => s.endpoint));
+
+    return (
+      await Promise.all(
+        allAssignments
+          .filter((a) => !storedEndpointSet.has(a.endpoint))
+          .map(async (a): Promise<UnownedServer | undefined> => {
+            // For any remote servers created in Colab web UI, assuming there
+            // is only one session per assignment.
+            let label: string;
+            try {
+              const sessions = await this.client.listSessions(
+                a.endpoint,
+                signal,
+              );
+              label =
+                sessions.length === 1 && sessions[0].name?.length
+                  ? sessions[0].name
+                  : UNKNOWN_REMOTE_SERVER_NAME;
+            } catch (error: unknown) {
+              // The assignment may have been removed (e.g. via Colab web UI
+              // or another VS Code instance sharing the account) between
+              // listing assignments and listing its sessions. Drop it from
+              // the result rather than failing the entire call.
+              if (
+                error instanceof ColabRequestError &&
+                error.response.status === 404
+              ) {
+                log.trace(
+                  `Dropping orphan assignment ${a.endpoint} - sessions endpoint returned 404`,
+                  error,
+                );
+                return undefined;
+              }
+              // For any other failure, fail open with a placeholder label so
+              // we still surface the assignment to the user.
+              log.warn(
+                `Failed to list sessions for assignment ${a.endpoint}, falling back to placeholder label`,
+                error,
+              );
+              label = UNKNOWN_REMOTE_SERVER_NAME;
+            }
+            return {
+              label,
+              endpoint: a.endpoint,
+              variant: a.variant,
+              accelerator: a.accelerator,
+            };
+          }),
+      )
+    ).filter((s): s is UnownedServer => s !== undefined);
+  }
+
   private async notifyAllAcceleratorsUnavailable(
     error: AllAcceleratorsUnavailableError,
   ) {
@@ -815,7 +875,10 @@ class AllAcceleratorsUnavailableError extends Error {
  * To work around this, we create a new `Request` instance to ensure
  * compatibility.
  *
- * @param token - The cancellation token.
+ * Colab proxy headers always win over any caller-supplied values for the
+ * same keys.
+ *
+ * @param token - The Colab runtime proxy token.
  * @returns A fetch function that adds the Colab runtime proxy token as a
  * header.
  */
@@ -823,19 +886,20 @@ function colabProxyFetch(
   token: string,
 ): (info: RequestInfo, init?: RequestInit) => Promise<Response> {
   return async (info: RequestInfo, init?: RequestInit) => {
+    let infoHeaders: Headers | undefined;
     if (isRequest(info)) {
       // Ensure compatibility with `node-fetch`
       info = new Request(info.url, info);
+      infoHeaders = info.headers;
     }
 
-    init ??= {};
-    const headers = new Headers(init.headers);
-    headers.append(COLAB_RUNTIME_PROXY_TOKEN_HEADER.key, token);
-    headers.append(
-      COLAB_CLIENT_AGENT_HEADER.key,
-      COLAB_CLIENT_AGENT_HEADER.value,
-    );
-    init.headers = headers;
+    const headers = new Headers(infoHeaders);
+    new Headers(init?.headers).forEach((value, key) => {
+      headers.set(key, value);
+    });
+    headers.set(COLAB_RUNTIME_PROXY_TOKEN_HEADER.key, token);
+    headers.set(COLAB_CLIENT_AGENT_HEADER.key, COLAB_CLIENT_AGENT_HEADER.value);
+    init = { ...init, headers };
 
     return fetch(info, init);
   };
@@ -853,4 +917,23 @@ function isColabServerDescriptorWithAccelerator(
   descriptor: ColabServerDescriptor,
 ): descriptor is ColabServerDescriptorWithAccelerator {
   return !!descriptor.accelerator;
+}
+
+function errorToAssignmentOutcome(error: unknown): AssignmentOutcome {
+  if (error instanceof AllAcceleratorsUnavailableError) {
+    return AssignmentOutcome.ASSIGNMENT_OUTCOME_ALL_ACCELERATORS_UNAVAILABLE;
+  }
+  if (error instanceof AcceleratorUnavailableError) {
+    return AssignmentOutcome.ASSIGNMENT_OUTCOME_ACCELERATOR_UNAVAILABLE;
+  }
+  if (error instanceof TooManyAssignmentsError) {
+    return AssignmentOutcome.ASSIGNMENT_OUTCOME_TOO_MANY_ASSIGNMENTS;
+  }
+  if (error instanceof InsufficientQuotaError) {
+    return AssignmentOutcome.ASSIGNMENT_OUTCOME_INSUFFICIENT_QUOTA;
+  }
+  if (error instanceof DenylistedError) {
+    return AssignmentOutcome.ASSIGNMENT_OUTCOME_DENYLISTED;
+  }
+  return AssignmentOutcome.ASSIGNMENT_OUTCOME_OTHER_FAILURE;
 }

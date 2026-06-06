@@ -17,11 +17,13 @@
 # This script is used to run end-to-end tests for the Colab VS Code extension.
 #
 # Usage:
-#   ./scripts/test_e2e.sh [--headless] [--vsix=<path_to_vsix_file>] [--auth-driver:<args>...]
+#   ./scripts/test_e2e.sh [--headless] [--grep=<pattern>] [--vsix=<path_to_vsix_file>] [--auth-driver:<args>...]
 #
 # Arguments:
 #   - storage=<path>: Path to use for extest storage.
 #   - headless: Run tests in headless mode using xvfb.
+#   - grep=<pattern>: Only run tests matching the given pattern. Can also be
+#     set via the GREP_PATTERN environment variable.
 #   - vsix=<path_to_vsix_file>: Install the specified VSIX file before running tests.
 #   - auth-driver:<args>: Pass additional arguments to the authentication driver.
 #
@@ -35,6 +37,7 @@ set -euo pipefail
 
 STORAGE=""
 HEADLESS=0
+GREP_PATTERN=".*"
 VSIX_FILE=""
 AUTH_DRIVER_ARGS=()
 # Defined after flags are parsed.
@@ -48,6 +51,7 @@ Usage:
 Arguments:
   --storage=<path>         Path to use for extest storage.
   --headless               Run tests in headless mode using xvfb.
+  --grep=<pattern>         Only run tests matching the given pattern.
   --vsix=<path_to_vsix>    Install the specified VSIX file and run the tests against it instead of building from source.
   --auth-driver:<arg>      Pass arguments to the authentication driver. Can be used multiple times.
   -h, --help               Show this help message.
@@ -63,6 +67,9 @@ parse_args() {
     --headless)
       HEADLESS=1
       ;;
+    --grep=*)
+      GREP_PATTERN="${arg#--grep=}"
+      ;;
     --vsix=*)
       VSIX_FILE="${arg#--vsix=}"
       ;;
@@ -74,7 +81,7 @@ parse_args() {
       exit 0
       ;;
     *)
-      echo "🤷‍♂️ Unknown argument: $arg" >&2
+      echo "🤷 Unknown argument: $arg" >&2
       usage
       exit 1
       ;;
@@ -118,14 +125,20 @@ build_test_cmd() {
 
   base_cmd+=("-o" "./out/test/test/e2e/settings.json")
   base_cmd+=("-m" "./out/test/test/e2e/mocharc.js")
+  # Open a fixture workspace folder so e2e tests have a populated Explorer.
+  # Referenced from the source tree because the build does not copy .txt files
+  # into out/.
+  base_cmd+=("-r" "./src/test/e2e/fixtures/workspace")
 
   # Print each part of the command on a new line.
   printf "%s\n" "${base_cmd[@]}"
+  # The `--` separator terminates the variadic `-r` option and ensures
+  # subsequent paths are parsed as positional `testFiles` arguments.
+  printf "%s\n" "--"
   printf "%s\n" ./out/test/test/e2e/test-setup.js
   printf "%s\n" ./out/test/**/*.e2e.test.js
 
   if [[ ${#AUTH_DRIVER_ARGS[@]} -gt 0 ]]; then
-    printf "%s\n" "--"
     printf "%s\n" "${AUTH_DRIVER_ARGS[@]}"
   fi
 }
@@ -143,6 +156,7 @@ run_tests() {
 main() {
   parse_args "$@"
   [[ -n "$STORAGE" ]] && storage_flag=(--storage="$STORAGE")
+  export MOCHA_GREP="$GREP_PATTERN"
   check_deps
   setup_extest
   local test_cmd=()

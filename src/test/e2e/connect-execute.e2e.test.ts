@@ -4,11 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { Workbench, WebElement, InputBox, Key } from 'vscode-extension-tester';
+import { Workbench, WebElement } from 'vscode-extension-tester';
 import {
   assertAllCellsExecutedSuccessfully,
+  confirmInputBoxWithDefault,
   createNotebook,
   hasQuickPickItem,
+  KERNEL_SELECT_WAIT_MS,
+  safeExecuteCommand,
   selectQuickPickItem,
   selectQuickPicksInOrder,
 } from './ui';
@@ -20,32 +23,38 @@ it('executes basic code cells', async () => {
   await createNotebook(workbench);
 
   // Connect to Colab.
-  await workbench.executeCommand('Notebook: Select Notebook Kernel');
+  await safeExecuteCommand(workbench, 'Notebook: Select Notebook Kernel');
   // If the test is running on a machine with a configured Python environment,
   // the "Select Another Kernel" option may appear instead of "Colab". If so, we
   // need to click it first before selecting "Colab".
-  if (await hasQuickPickItem(driver, 'Select Another Kernel')) {
-    await selectQuickPickItem(driver, 'Select Another Kernel');
+  if (await hasQuickPickItem(driver, 'kernel', 'Select Another Kernel')) {
+    await selectQuickPickItem(driver, 'kernel', 'Select Another Kernel');
   }
   await selectQuickPicksInOrder(driver, [
-    'Colab',
-    'New Colab Server',
-    'CPU',
-    'Latest',
+    { picker: 'kernel source', item: 'Colab' },
+    { picker: 'Select a remote server', item: 'New Colab Server' },
+    { picker: 'Select a variant', item: 'CPU' },
+    { picker: 'Select a runtime version', item: 'Latest' },
   ]);
-  // Alias the server with the default name.
-  const inputBox = await InputBox.create();
-  await inputBox.sendKeys(Key.ENTER);
-  await selectQuickPickItem(driver, 'Python');
+  // Alias the server with the default name. We poll until the alias InputBox
+  // is actually shown before confirming, otherwise the ENTER keystroke can be
+  // delivered to the still-focused QuickPick from the previous step and lost.
+  await confirmInputBoxWithDefault(driver, 'Alias your server');
+  await selectQuickPickItem(
+    driver,
+    'Select a Kernel',
+    'Python',
+    KERNEL_SELECT_WAIT_MS,
+  );
 
   // Input code into the first cell.
   let focusedCell: WebElement;
-  await workbench.executeCommand('Notebook: Edit Cell');
+  await safeExecuteCommand(workbench, 'Notebook: Edit Cell');
   focusedCell = await driver.switchTo().activeElement();
   await focusedCell.sendKeys('1 + 1');
 
   // Add a second cell to display a data frame.
-  await workbench.executeCommand('Notebook: Insert Code Cell Below');
+  await safeExecuteCommand(workbench, 'Notebook: Insert Code Cell Below');
   focusedCell = await driver.switchTo().activeElement();
   await focusedCell.sendKeys(`import pandas as pd
 df = pd.DataFrame({
@@ -55,14 +64,14 @@ df = pd.DataFrame({
 df`);
 
   // Add a third cell to plot the data frame.
-  await workbench.executeCommand('Notebook: Insert Code Cell Below');
+  await safeExecuteCommand(workbench, 'Notebook: Insert Code Cell Below');
   focusedCell = await driver.switchTo().activeElement();
   await focusedCell.sendKeys('df.plot()');
 
-  await workbench.executeCommand('Notebook: Run All');
+  await safeExecuteCommand(workbench, 'Notebook: Run All');
   // Collapsing all cell outputs so execution status of all 3 cells are in
   // the viewport.
-  await workbench.executeCommand('Notebook: Collapse All Cell Outputs');
+  await safeExecuteCommand(workbench, 'Notebook: Collapse All Cell Outputs');
 
   await assertAllCellsExecutedSuccessfully(driver, workbench);
 });

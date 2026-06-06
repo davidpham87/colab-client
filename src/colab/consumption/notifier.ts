@@ -5,7 +5,8 @@
  */
 
 import vscode, { Disposable, Event } from 'vscode';
-import { CommandSource } from '../../telemetry/api';
+import { telemetry } from '../../telemetry';
+import { CommandSource, LowBalanceSeverity } from '../../telemetry/api';
 import { ConsumptionUserInfo, SubscriptionTier } from '../api';
 import { openColabSignup } from '../commands/external';
 
@@ -89,14 +90,20 @@ export class ConsumptionNotifier implements Disposable {
       return;
     }
 
+    const severity =
+      notification.notify === this.vs.window.showErrorMessage
+        ? LowBalanceSeverity.SEVERITY_DEPLETED
+        : LowBalanceSeverity.SEVERITY_LOW;
     const action = notification.notify(
       notification.message,
       this.getTierRelevantAction(info.subscriptionTier, paidMinutesLeft > 0),
     );
     this.setSnoozeTimeout(notification.notify);
-    if (await action) {
+    const clicked = !!(await action);
+    if (clicked) {
       openColabSignup(this.vs, CommandSource.COMMAND_SOURCE_NOTIFICATION);
     }
+    telemetry.logLowCcuNotification(severity, info.subscriptionTier, clicked);
   }
 
   private buildNotification(totalMinutesLeft: number):
@@ -182,7 +189,7 @@ function calculateRoughMinutesLeft(
     return 0;
   }
   // Free quota is in milli-CCUs.
-  const freeCcu = freeQuota.remainingTokens / 1000;
+  const freeCcu = (freeQuota.remainingTokens ?? 0) / 1000;
   return Math.floor((freeCcu / consumptionUserInfo.consumptionRateHourly) * 60);
 }
 

@@ -61,7 +61,6 @@ export class ResourceTreeProvider
     authChange: Event<AuthChangeEvent>,
     private readonly client: ColabClient,
   ) {
-    // TODO: Handle rapid assignment changes and race conditions
     this.assignmentListener = assignmentChange(this.refresh.bind(this));
     this.authListener = authChange(this.handleAuthChange.bind(this));
 
@@ -127,6 +126,11 @@ export class ResourceTreeProvider
   /**
    * Gets the children of a {@link ResourceItem} for the tree view.
    *
+   * Each call returns its own snapshot of the current state, intentionally not
+   * coalesced or cancelled when other calls overlap.
+   * {@link TreeDataProvider.onDidChangeTreeData} is the mechanism that signals
+   * VS Code to re-query for fresh data.
+   *
    * @param element - The {@link ResourceItem} element.
    * @returns A promise that resolves to an array of {@link ResourceItem}
    * children.
@@ -147,8 +151,18 @@ export class ResourceTreeProvider
       return this.resourceItemsByEndpoint.get(element.endpoint) ?? [];
     }
 
-    // If no element is passed (requested at root level), fetch and cache all
-    // servers and their resources.
+    // If no element is passed (requested at root level), fetch and return
+    // all servers as root items.
+    return this.getRootChildren();
+  }
+
+  /**
+   * Fetches and caches all servers and their resources.
+   *
+   * @returns A promise that resolves to an array of {@link ResourceItem}
+   * representing servers.
+   */
+  private async getRootChildren(): Promise<ResourceItem[]> {
     const servers = await this.assignments.getServers('extension');
     return Promise.all(
       servers.map(async (s) => {
